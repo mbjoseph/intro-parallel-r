@@ -1,0 +1,8 @@
+*.out
+*.err
+.nfs*
+.Rproj.user
+.Rhistory
+slides.pdf
+*.Rproj
+

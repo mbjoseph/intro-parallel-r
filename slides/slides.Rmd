@@ -1,0 +1,551 @@
+---
+title: "Introduction to parallel R"
+subtitle: \Large{Max Joseph} \newline Earth Lab, CU Boulder \newline \url{github.com/mbjoseph/intro-parallel-r}
+author: ""
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  beamer_presentation:
+    latex_engine: xelatex
+header-includes:
+- \usepackage{blindtext}
+- \usetheme{Execushares}
+---
+
+```{r, echo = FALSE, message = FALSE}
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(snowfall)
+# set some global options
+opts_chunk$set(comment = NA, 
+               fig.width = 2.6, 
+               fig.height = 2.2, 
+               fig.align = 'center')
+
+theme_set(theme_minimal(base_size = 8) + 
+            theme(panel.grid.minor = element_blank()))
+ps <- 1
+```
+
+## What is parallel computing?
+
+Processes run simultaneously (e.g., on separate cores)
+
+![AMD Athlon™ X2 Dual-Core Processor 6400+ in AM2 package (David W. Smith)](https://upload.wikimedia.org/wikipedia/commons/f/fb/Athlon64x2-6400plus.jpg)
+
+
+
+## Parallel computing analogy
+
+We want 100 coin flips
+
+**In serial**: 
+
+flip one coin 100 times
+
+**In parallel**: 
+
+get 100 people to flip 1 coin each simultaneously
+
+
+
+## Why parallelism?
+
+1. Speed gains
+
+```{r, echo = FALSE, fig.width = 3.5, fig.height = 2.3}
+# compute theoretical speedup in latency for computations
+# across a range of N_processors and percent parallel
+n_processors <- 2^(0:14)
+p <- c(.5, .75, .9, .95, .975)
+d <- expand.grid(n = n_processors, p = p)
+d <- d %>%
+  mutate(speedup =  1 / ((1 - p) + p / n))
+label_d <- d %>%
+  group_by(p) %>%
+  summarize(n = max(n), 
+         speedup = max(speedup), 
+         label = unique(paste0(100 * p, '% parallel')))
+
+ggplot(d, aes(x = n, y = speedup, group = p)) + 
+  geom_line() + 
+  scale_x_log10(limits = c(1, 2^18), breaks = n_processors) + 
+  geom_text(data = label_d, aes(label = label), nudge_x = .8, size = 2.4) + 
+  theme(legend.position = 'none') + 
+  xlab('Number of processors') + 
+  ylab('Theoretical speedup') + 
+  theme(axis.text.x = element_text(angle = 45))
+```
+
+
+## When to parallelize?
+
+- speed gains required
+- other optimizations are not enough
+- the task can be parallelized
+
+
+
+## Embarrasingly parallel tasks
+
+Little to no dependency among tasks (e.g,. computing row sums)
+
+$$\begin{bmatrix}
+    1 & 4 & 7\\
+    2 & 5 & 8\\
+    3 & 6 & 9
+  \end{bmatrix} \rightarrow 
+  \begin{bmatrix}
+    12\\
+    15\\
+    18
+  \end{bmatrix}$$
+
+
+
+## Dependent process: random walk
+
+$$y_t = y_{t - 1} + \text{Normal}(0, 1)$$
+
+```{r, echo = FALSE, fig.height = 2}
+n <- 100
+epsilon <- rnorm(n)
+y <- rep(NA, n)
+y[1] <- 0
+for (i in 2:n) y[i] <- y[i - 1] + epsilon[i]
+
+data.frame(t = 1:n, y = y) %>%
+  ggplot(aes(x = t, y = y)) + 
+  geom_path() + 
+  xlab('Time')
+```
+
+
+
+
+## Making parallel-ready R code
+
+1. Start with a serial implementation
+2. Port it to a parallel-friendly function
+
+
+
+## `for` loops
+
+```{r}
+M <- matrix(1:9, nrow = 3)
+for (i in 1:3) {
+  print(sum(M[i, ]))
+}
+```
+
+- imposes meaningless ordering
+- allows for dependence (e.g., we could access row `i - 1`)
+
+
+
+## `apply()` instead
+
+```{r}
+M <- matrix(1:9, nrow = 3)
+apply(M, 1, sum)
+```
+
+- idiomatic in R
+- easier to parallelize 
+- operations are unambiguously independent
+
+
+
+## `apply()` visualized
+
+![http://blog.datacamp.com/wp-content/uploads/2015/07/Apply_function.png](http://blog.datacamp.com/wp-content/uploads/2015/07/Apply_function.png)
+
+
+
+## A more complex example
+
+```{r, echo = FALSE}
+library(ggplot2)
+
+f <- function(x, y) {
+  # unit disk function (region in plane bounded by circle)
+  # whose area is pi
+  # - the value of the function is one in the circle, and zero elsewhere
+  # - the radius of the circle is 1
+  # - the integral of the function over x and y is known to be pi
+  ifelse(x^2 + y^2 <= 1, 1, 0)
+}
+
+# generate a circular path to plot
+tt <- seq(0, 2 * pi, length.out = 500)
+circle_path <- data.frame(x = cos(tt), y = sin(tt))
+
+p <- ggplot(circle_path, aes(x = x, y = y)) +
+  geom_path() +
+  coord_equal()
+p
+```
+
+**Goal**: estimate the area of a circle with radius $= 1$ and area $= \pi$ using Monte carlo integration.
+
+
+
+## Monte Carlo integration
+
+```{r, echo = FALSE}
+# generate a random sample of points on the interval
+# x \in (-1, 1), y \in (-1, 1)
+n_points <- 1000
+mc_points <- data.frame(x = runif(n_points, -1, 1),
+                        y = runif(n_points, -1, 1))
+
+# evaluate the function at each point and plot results
+mc_points$f <- f(x = mc_points$x, y = mc_points$y)
+mc_points$f_fact <- as.factor(mc_points$f)
+
+
+# approximate pi
+mc_volume <- 4 # (volume of sampling space: square with length 2, A = 2**2)
+
+pi_hat <- mc_volume * sum(mc_points$f) / n_points
+
+ggplot(mc_points, aes(x = x, y = y)) + 
+  geom_point(shape = 1, size = ps) +
+  geom_path(data = circle_path) + 
+  coord_equal()
+```
+
+
+
+## Monte Carlo integration
+
+```{r, echo = FALSE}
+ggplot(mc_points, aes(x = x, y = y)) + 
+  geom_point(aes(color = f_fact), size = ps) +
+  coord_equal() + 
+  scale_color_discrete(expression(paste(f(bar(x)[i]))))
+```
+
+
+
+## Monte Carlo integration
+
+```{r, echo = FALSE}
+ggplot(mc_points, aes(x = x, y = y)) + 
+  geom_point(aes(color = f_fact), size = ps) +
+  coord_equal() + 
+  scale_color_discrete(expression(paste(f(bar(x)[i])))) + 
+  ggtitle(substitute(paste(hat(pi), '=', pi_hat), 
+                     list(pi_hat = pi_hat)))
+```
+
+$$\hat{\pi} = V N^{-1} \displaystyle \sum_{i = 1}^N f(\bar{x}_i)$$
+
+
+
+## MC integration in R
+
+```{r, echo = TRUE}
+approx_pi <- function(n) {
+  # estimate pi w/ MC integration
+  x <- runif(n, min = -1, max = 1)
+  y <- runif(n, min = -1, max = 1)
+  V <- 4
+  f_hat <- ifelse(x^2 + y^2 <= 1, 1, 0)
+  V * sum(f_hat) / n
+}
+```
+
+
+
+## How does $N$ influence $\hat{\pi}$?
+
+```{r}
+n <- seq(10, 10000, by = 10)
+pi_hat <- rep(NA, length(n))
+
+for (i in seq_along(n)) {
+  pi_hat[i] <- approx_pi(n[i])
+}
+```
+
+
+
+## How does $N$ influence $\hat{\pi}$?
+
+```{r, echo = FALSE, fig.height = 2}
+data.frame(n, pi_hat) %>%
+  ggplot(aes(x = n, y = pi_hat)) + 
+  geom_point(shape = 1, size = ps * .5) + 
+  xlab('Number of MC samples') + 
+  ylab(expression(paste(hat(pi))))
+```
+
+
+
+## Avoiding a for-loop
+
+`lapply()` returns a list
+
+```{r, echo = TRUE}
+pi_hat <- lapply(n, approx_pi)
+str(pi_hat[1:5])
+```
+
+
+
+## `apply()` for vectors
+
+`sapply()` returns vectors, matrices, and arrays
+
+```{r}
+pi_hat <- sapply(n, approx_pi)
+str(pi_hat)
+```
+
+
+
+## Local parallelization
+
+Each MC integration is embarrasingly parallel!
+
+To parallelize:
+
+1. start a cluster
+2. compute simultaneously across the cluster
+3. gather results
+4. close cluster
+
+
+
+
+## the `parallel` package
+
+```{r}
+library(parallel)
+cl <- makeCluster(2)
+
+pi_hat <- parSapply(cl, n, approx_pi)
+
+stopCluster(cl)
+```
+
+
+## doMC and foreach
+
+```{r, message = FALSE}
+library(doMC)
+registerDoMC(2)
+
+pis <- foreach(i = 1:length(n)) %dopar% {
+  approx_pi(n[i])
+}
+
+class(pis)
+```
+
+
+
+## Custom combines via `.combine`
+
+```{r, message = FALSE}
+foreach(i = 1:length(n), .combine = c) %dopar% {
+  approx_pi(n[i])
+} %>%
+  str()
+```
+
+
+
+## What if we want one estimate?
+
+Now, suppose we want **one** precise estimate of $\pi$:
+
+$\rightarrow$ we need lots of MC samples!
+
+e.g., if we drop $N$ points $J$ times:
+
+$$\hat{\pi} = V (NJ)^{-1} \displaystyle \sum_{j=1}^J \sum_{i = 1}^N f(\bar{x}_{ij})$$
+
+
+
+## Getting one precise estimate
+
+```{r}
+sum_f <- function(n) {
+  x <- runif(n, min = -1, max = 1)
+  y <- runif(n, min = -1, max = 1)
+  sum(x^2 + y^2 <= 1)
+}
+```
+
+$$\hat{\pi} = V (NJ)^{-1} \displaystyle \sum_{j=1}^J \color{blue}{\sum_{i = 1}^N f(\bar{x}_{ij}})$$
+
+
+## Getting one precise estimate
+
+```{r}
+N <- 10000
+J <- 10000
+n <- rep(N, J)
+
+cl <- makeCluster(4)
+f_sums <- parSapply(cl, n, sum_f)
+stopCluster(cl)
+
+4 * sum(f_sums) / (N * J) - pi
+```
+
+
+
+## Parallel R in HPC environments
+
+Communication across nodes via message passing interface (MPI)
+
+- *de facto* standard on distributed memory systems
+
+**Relevant R packages**:
+
+- Rmpi
+- snow
+- snowfall
+- pbdR
+
+
+
+## Rmpi
+
+**Initialization**: 
+
+`mpi.spawn.Rslaves(nslaves = ...)`
+
+**Execution**: 
+
+`mpi.bcast.cmd(...)`
+
+`mpi.remote.exec(...)`
+
+**Shut down**: 
+
+`mpi.close.Rslaves()`
+
+
+
+## snow
+
+Simple network of workstations
+
+**Initialization**: 
+
+`cl <- makeCluster(...)`
+
+**Execution**: 
+
+`clusterExport(cl, list, envir = .GlobalEnv)`
+
+`clusterCall(cl, function)`
+
+`clusterApply(cl, x, fun)`
+
+`clusterApplyLB(cl, x, fun) # load balanced` 
+
+**Shut down**: 
+
+`stopCluster(cl)`
+
+
+
+## snowfall
+
+Simpler simple network of workstations
+
+**Initialization**: 
+
+`sfInit(parallel = TRUE, cpus = ...)`
+
+**Execution**: 
+
+`sfLibrary(dplyr)`
+
+`sfSource("file.R")`
+
+`sfExport(...)`
+
+`sfClusterApply(x, fun)`
+
+`sfClusterApplyLB(x, fun)`
+
+**Shut down**: 
+
+`sfStop()`
+
+
+
+## Local snowfall
+
+```{r, message = FALSE, warning = FALSE}
+sfInit(parallel = TRUE, cpus = 2)
+sfClusterEval(print("yummie"))
+sfStop()
+```
+
+
+
+## Advantages of snowfall
+
+1. Easy prototyping on a local multicore machine
+
+**Local**
+
+```
+sfInit(parallel = TRUE, cpus = 2)
+```
+
+**Remote**
+
+```
+sfInit(parallel = TRUE, cpus = 240, type = "MPI")
+```
+
+
+## Advantages of snowfall
+
+1. Easy prototyping on a local multicore machine
+2. Easy serial execution
+
+```{r, message=FALSE, warning = FALSE}
+sfInit(parallel = FALSE, cpus = 2)
+sfClusterEval(print("yummie"))
+sfStop()
+```
+
+
+
+## Disadvantages of snowfall
+
+1. `Rmpi` and `snow` are dependencies
+2. Very thin wrapper around `snow`
+- if you don't need serial execution, maybe `snow` is sufficient
+
+
+
+## TL;DL
+
+To make parallel R easier:
+
+1. Know what's parallelizable
+1. Use the `apply()` functions
+1. `snow`/`snowfall` work locally *and* in an HPC environment
+
+
+
+## Thank you
+
+**Slides**: figshare.com/articles/Introduction_to_parallel_R/3848310
+
+**Source code**: github.com/mbjoseph/intro-parallel-r
+
+**E-mail**: maxwell.b.joseph@colorado.edu
+
+
