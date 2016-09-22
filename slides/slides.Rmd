@@ -15,6 +15,7 @@ header-includes:
 library(knitr)
 library(ggplot2)
 library(dplyr)
+library(parallel)
 library(snowfall)
 # set some global options
 opts_chunk$set(comment = NA, 
@@ -323,7 +324,6 @@ To parallelize:
 ## the `parallel` package
 
 ```{r}
-library(parallel)
 cl <- makeCluster(2)
 
 pi_hat <- parSapply(cl, n, approx_pi)
